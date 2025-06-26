@@ -2,47 +2,80 @@ name: Deploy Frontend to AKS
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
 
 permissions:
-  id-token: write
+  id-token: write # for OIDC
   contents: read
 
 env:
-  AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-  AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-  AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-  ACR_NAME: todoregistryxyz
   RESOURCE_GROUP: todo-rg-dev
   AKS_CLUSTER_NAME: todo-aks
-  CONTAINER_NAME: frontend
+  ACR_LOGIN_SERVER: todoregistryxyz.azurecr.io
+  CONTAINER_NAME: todo-frontend
+  K8S_MANIFEST: k8s/deployments.yaml
 
 jobs:
-  build-and-deploy:
+  deploy:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Login to Azure with OIDC
-        uses: azure/login@v1
+      - name: Azure OIDC Login
+        uses: azure/login@v2
         with:
-          client-id: ${{ env.AZURE_CLIENT_ID }}
-          tenant-id: ${{ env.AZURE_TENANT_ID }}
-          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Build and Push to ACR
+      - name: Build & Push Image
         run: |
-          az acr login --name $ACR_NAME
-          docker build -t $ACR_NAME.azurecr.io/$CONTAINER_NAME:${{ github.sha }} .
-          docker push $ACR_NAME.azurecr.io/$CONTAINER_NAME:${{ github.sha }}
+          az acr login --name ${ACR_LOGIN_SERVER%%.*}
+          IMAGE=${ACR_LOGIN_SERVER}/${CONTAINER_NAME}:${GITHUB_SHA}
+          docker build -t $IMAGE .
+          docker push $IMAGE
+        env:
+          ACR_LOGIN_SERVER: ${{ env.ACR_LOGIN_SERVER }}
+          CONTAINER_NAME: ${{ env.CONTAINER_NAME }}
 
-      - name: Set AKS context
+      - name: Set AKS Context
         run: |
-          az aks get-credentials --resource-group $RESOURCE_GROUP --name $AKS_CLUSTER_NAME --overwrite-existing
+          az aks get-credentials \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --name ${{ env.AKS_CLUSTER_NAME }} \
+            --overwrite-existing
 
-      - name: Deploy to AKS
+      - name: Apply K8s Manifests
         run: |
-          kubectl set image deployment/frontend frontend=$ACR_NAME.azurecr.io/$CONTAINER_NAME:${{ github.sha }}
+          kubectl apply -f ${{ env.K8S_MANIFEST }}
+
+      - name: Rollout New Image
+        run: |
+          kubectl set image deployment/todo-frontend \
+            todo-frontend=${ACR_LOGIN_SERVER}/${CONTAINER_NAME}:${GITHUB_SHA}
+          kubectl rollout status deployment/todo-frontend --timeout=120s
+        env:
+          ACR_LOGIN_SERVER: ${{ env.ACR_LOGIN_SERVER }}
+          CONTAINER_NAME: ${{ env.CONTAINER_NAME }}
+
+      - name: Fetch LoadBalancer IP
+        id: get_ip
+        run: |
+          IP=""
+          for i in {1..10}; do
+            IP=$(kubectl get svc todo-frontend \
+              -o jsonpath="{.status.loadBalancer.ingress[0].ip}")
+            if [[ -n "$IP" ]]; then break; fi
+            echo "Waiting for external IP..."
+            sleep 15
+          done
+          echo "Frontend external IP: $IP"
+          echo "::set-output name=ip::$IP"
+
+      - name: Smoke Test Frontend
+        run: |
+          URL="http://${{ steps.get_ip.outputs.ip }}"
+          echo "Testing $URL ..."
+          curl --fail --retry 5 --retry-delay 5 "$URL" || exit 1
