@@ -14,9 +14,21 @@ spec:
     spec:
       containers:
         - name: todo-frontend
-          image: todoregistryxyz.azurecr.io/todo-frontend:latest
+          image: todoacr0123456789.azurecr.io/todo-frontend:latest
           ports:
             - containerPort: 80
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 15
+            periodSeconds: 20
 ---
 apiVersion: v1
 kind: Service
